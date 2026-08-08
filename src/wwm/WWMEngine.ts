@@ -7,8 +7,6 @@ import {
     WWMWorldState,
 } from "./types";
 
-import { ENGINE_CONFIG, RISK_THRESHOLDS } from "./constants";
-
 /**
  * WWM v2 — Core Engine
  *
@@ -16,8 +14,8 @@ import { ENGINE_CONFIG, RISK_THRESHOLDS } from "./constants";
  * - Own the current WWM state
  * - Start / pause / resume / stop the engine
  * - Notify subscribers when state changes
- * - Provide a controlled entry point for future
- *   perception, sensors, risk, navigation and guidance modules
+ * - Accept state updates pushed in by external modules
+ *   (perception, sensors, risk, navigation, safety, guidance)
  *
  * This class intentionally does NOT perform:
  * - Camera processing
@@ -26,18 +24,21 @@ import { ENGINE_CONFIG, RISK_THRESHOLDS } from "./constants";
  * - XGBoost inference
  * - GPS processing
  * - LLM calls
+ * - Navigation planning
+ * - Safety decisions
+ * - UI rendering
  *
- * Those responsibilities will be added as independent modules.
+ * It has no update loop of its own. It is purely reactive: it holds
+ * state, and other modules call updateWorld() / updateGuidance() when
+ * they have something new to report. Those calls are only accepted
+ * while the engine is "running" — at all other times they are
+ * ignored so the last known state is preserved untouched.
  */
 
 export class WWMEngine {
   private state: WWMEngineState;
 
   private listeners = new Set<WWMStateListener>();
-
-  private updateTimer?: ReturnType<typeof setInterval>;
-
-  private lastGuidanceTimestamp = 0;
 
   constructor() {
     this.state = this.createInitialState();
@@ -49,67 +50,66 @@ export class WWMEngine {
 
   /**
    * Start the WWM engine.
+   *
+   * idle/stopped → initializing → running
    */
   public start(): void {
-    if (
-      this.state.status === "running" ||
-      this.state.status === "initializing"
-    ) {
+    if (this.state.status !== "idle" && this.state.status !== "stopped") {
       return;
     }
 
     this.setStatus("initializing");
 
-    this.setGuidance("starting", "Starting Walk With Me");
-
-    this.startUpdateLoop();
-
     this.setStatus("running");
-
-    this.setGuidance("calibrating", "Calibrating sensors");
   }
 
   /**
    * Pause WWM processing without destroying the current state.
+   *
+   * running → paused
+   *
+   * While paused, updateWorld() / updateGuidance() calls are ignored.
    */
   public pause(): void {
     if (this.state.status !== "running") {
       return;
     }
 
-    this.stopUpdateLoop();
-
     this.setStatus("paused");
   }
 
   /**
    * Resume WWM processing.
+   *
+   * paused → running
    */
   public resume(): void {
     if (this.state.status !== "paused") {
       return;
     }
 
-    this.startUpdateLoop();
-
     this.setStatus("running");
   }
 
   /**
    * Stop WWM completely.
+   *
+   * running/paused → stopped
    */
   public stop(): void {
-    this.stopUpdateLoop();
+    if (this.state.status !== "running" && this.state.status !== "paused") {
+      return;
+    }
 
     this.setStatus("stopped");
   }
 
   /**
    * Reset the engine back to its initial state.
+   *
+   * any state → idle, with a fresh initial world state
    */
   public reset(): void {
-    this.stopUpdateLoop();
-
     this.state = this.createInitialState();
 
     this.notifyListeners();
@@ -168,107 +168,64 @@ export class WWMEngine {
     }
   }
 
-  /* ------------------------------------------------------------------------ */
-  /*                         DEVELOPMENT / TEST API                           */
-  /* ------------------------------------------------------------------------ */
-
   /**
-   * Development-only helper.
+   * Merge a partial world-state update into the current state.
    *
-   * This allows us to simulate WWM states before real perception,
-   * navigation and ML systems are connected.
+   * This is the entry point future modules (perception, sensors,
+   * risk, navigation, safety) use to report new data. The engine
+   * does not compute any of these values itself — it only stores
+   * and broadcasts what it's given.
    *
-   * Later this method can be removed or restricted to development builds.
+   * Only accepted while the engine is running.
    */
-  public simulateGuidance(
-    guidance: GuidanceState,
-    instruction?: string,
-    reason?: string,
+  public updateWorld(
+    partial: Partial<Omit<WWMWorldState, "timestamp" | "guidance">>,
   ): void {
-    this.setGuidance(guidance, instruction, reason);
-  }
-
-  /**
-   * Development-only helper for testing risk thresholds.
-   */
-  public simulateRisk(probability: number): void {
-    const clampedProbability = Math.max(0, Math.min(1, probability));
-
-    const level = this.getRiskLevel(clampedProbability);
+    if (this.state.status !== "running") {
+      return;
+    }
 
     this.state = {
       ...this.state,
       world: {
         ...this.state.world,
-        risk: {
-          probability: clampedProbability,
-          level,
-          confidence: 1,
-          timestamp: Date.now(),
-        },
+        ...partial,
+        timestamp: Date.now(),
       },
     };
 
     this.notifyListeners();
   }
 
-  /* ------------------------------------------------------------------------ */
-  /*                         INTERNAL ENGINE LOOP                              */
-  /* ------------------------------------------------------------------------ */
-
-  private startUpdateLoop(): void {
-    if (this.updateTimer) {
-      return;
-    }
-
-    this.updateTimer = setInterval(() => {
-      this.processTick();
-    }, ENGINE_CONFIG.UPDATE_INTERVAL_MS);
-  }
-
-  private stopUpdateLoop(): void {
-    if (!this.updateTimer) {
-      return;
-    }
-
-    clearInterval(this.updateTimer);
-
-    this.updateTimer = undefined;
-  }
-
   /**
-   * Main WWM processing cycle.
+   * Report a new guidance state.
    *
-   * At this stage this is intentionally minimal.
+   * This is the entry point a future GuidanceController uses to push
+   * guidance updates. The engine applies it as-is — no debouncing,
+   * no rate limiting; that policy belongs to whichever module decides
+   * when guidance should change.
    *
-   * Future pipeline:
-   *
-   * sensors
-   *    ↓
-   * perception
-   *    ↓
-   * world model
-   *    ↓
-   * risk engine
-   *    ↓
-   * safety controller
-   *    ↓
-   * local planner
-   *    ↓
-   * guidance
+   * Only accepted while the engine is running.
    */
-  private processTick(): void {
+  public updateGuidance(
+    guidance: GuidanceState,
+    instruction?: string,
+    reason?: string,
+  ): void {
     if (this.state.status !== "running") {
       return;
     }
-
-    const now = Date.now();
 
     this.state = {
       ...this.state,
       world: {
         ...this.state.world,
-        timestamp: now,
+        guidance: {
+          state: guidance,
+          instruction,
+          reason,
+          timestamp: Date.now(),
+        },
       },
     };
 
@@ -286,64 +243,6 @@ export class WWMEngine {
     };
 
     this.notifyListeners();
-  }
-
-  private setGuidance(
-    guidance: GuidanceState,
-    instruction?: string,
-    reason?: string,
-  ): void {
-    const now = Date.now();
-
-    /*
-     * Prevent excessive guidance events.
-     *
-     * Critical states such as STOP should eventually bypass this
-     * mechanism through the SafetyController.
-     */
-    if (
-      guidance !== "stop" &&
-      now - this.lastGuidanceTimestamp < ENGINE_CONFIG.MIN_GUIDANCE_INTERVAL_MS
-    ) {
-      return;
-    }
-
-    this.lastGuidanceTimestamp = now;
-
-    this.state = {
-      ...this.state,
-      world: {
-        ...this.state.world,
-        guidance: {
-          state: guidance,
-          instruction,
-          reason,
-          timestamp: now,
-        },
-      },
-    };
-
-    this.notifyListeners();
-  }
-
-  private getRiskLevel(probability: number): WWMWorldState["risk"]["level"] {
-    if (probability >= RISK_THRESHOLDS.CRITICAL) {
-      return "critical";
-    }
-
-    if (probability >= RISK_THRESHOLDS.HIGH) {
-      return "high";
-    }
-
-    if (probability >= RISK_THRESHOLDS.MODERATE) {
-      return "moderate";
-    }
-
-    if (probability >= RISK_THRESHOLDS.LOW) {
-      return "low";
-    }
-
-    return "low";
   }
 
   /* ------------------------------------------------------------------------ */

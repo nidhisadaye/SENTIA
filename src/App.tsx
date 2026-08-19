@@ -49,11 +49,10 @@ import {
 import { D, DIALOGUE_PREFIXES, FS } from "./dialogue";
 import { LANG_SELECT_AUDIO, LANGUAGES, WELCOME } from "./languages";
 import {
-  CLASSIFY_PROMPT,
   getConversationPrompt,
   getFaceDescPrompt,
   getScanPrompt,
-  READ_PROMPTS,
+  READ_PROMPTS
 } from "./prompts";
 import { intentRouter } from "./services/intentRouter";
 import { navigationService } from "./services/navigationService";
@@ -94,7 +93,7 @@ const GOOGLE_MAPS_KEY: string = USE_EAS_GOOGLE_MAPS_KEY
   ? GOOGLE_MAPS_EAS_KEY
   : GOOGLE_MAPS_EXPO_KEY;
 
-const GROQ_KEY: string = process.env.EXPO_PUBLIC_GROQ_KEY ?? "";
+const GROQ_KEY: string = process.env.EXPO_PUBLIC_GROQ_API_KEY ?? "";
 const OPENROUTER_KEY: string = process.env.EXPO_PUBLIC_OPENROUTER_KEY ?? "";
 const ROBOFLOW_API_KEY: string = Constants.expoConfig?.extra?.roboflowApiKey ?? "";
 const ROBOFLOW_MODEL_ID: string = Constants.expoConfig?.extra?.roboflowModelId ?? "";
@@ -971,28 +970,10 @@ useSpeechRecognitionEvent("error", (event) => {
     }
   };
 
-  const classifyImage = async (base64: string): Promise<OcrType> => {
-    const imageData = `data:image/jpeg;base64,${base64}`;
-    try {
-      const response = await groqRequest({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
-        max_tokens: 5,
-        temperature: 0.0,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: CLASSIFY_PROMPT },
-              { type: "image_url", image_url: { url: imageData } },
-            ],
-          },
-        ],
-      });
-      const label = response?.choices?.[0]?.message?.content?.trim().toLowerCase();
-      const valid: OcrType[] = ["medicine", "menu", "prescription", "govdoc", "currency", "form", "general"];
-      if (valid.includes(label as OcrType)) return label as OcrType;
-    } catch {}
-    return "general";
+  const classifyImage = async (_base64: string): Promise<OcrType> => {
+  // Avoid an extra Groq Vision request.
+  // The main OCR Vision request will read and interpret the document directly.
+  return "general";
   };
 
   const groqRequest = async (body: object, signal?: AbortSignal): Promise<any> => {
@@ -1077,7 +1058,7 @@ useSpeechRecognitionEvent("error", (event) => {
 
     try {
       const data = await groqRequest({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
+        model: "qwen/qwen3.6-27b",
         max_tokens: WWM_MAX_TOKENS,
         temperature: 0.1,
         messages: [
@@ -1100,71 +1081,72 @@ useSpeechRecognitionEvent("error", (event) => {
     return "";
   };
 
-  const callVisionAI = async (base64: string, lang: LangKey, prompt: string, maxTokens: number): Promise<string> => {
+  const callVisionAI = async (
+    base64: string,
+    lang: LangKey,
+    prompt: string,
+    maxTokens: number
+  ): Promise<string> => {
     const imageData = `data:image/jpeg;base64,${base64}`;
 
     if (USE_DIRECT && !GROQ_KEY && !OPENROUTER_KEY) {
       const errMsg = D("no_api_key", lang);
-      setStatus("❌ No API keys — check app.config.js");
+      setStatus("No API keys");
       speak(errMsg, lang);
       return "";
     }
 
     try {
       setStatus("Calling Groq...");
+
       const data = await groqRequest({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
-        max_tokens: maxTokens,
+        model: "qwen/qwen3.6-27b",
+        max_tokens: 80,
         temperature: 0.25,
+        reasoning_effort: "none",
         messages: [
           {
             role: "user",
             content: [
-              { type: "text", text: prompt },
-              { type: "image_url", image_url: { url: imageData } },
+              {
+                type: "text",
+                text:
+                  `${prompt}\n\n` +
+                  "IMPORTANT: Read the text in the image and return ONLY the readable text. " +
+                  "Do not explain your reasoning. Do not describe the image. " +
+                  "Do not use <think> tags.",
+              },
+              {
+                type: "image_url",
+                image_url: { url: imageData },
+              },
             ],
           },
         ],
       });
-      const text = data?.choices?.[0]?.message?.content?.trim();
+
+      const text =
+        data?.choices?.[0]?.message?.content?.trim() ?? "";
+
+      console.log(
+        "GROQ VISION RESPONSE:",
+        JSON.stringify(data?.choices?.[0]?.message)
+      );
+      console.log("GROQ VISION TEXT:", text);
+
       if (text && text.length >= MIN_VALID_RESPONSE_LENGTH) {
         setStatus("Groq ✓");
         return text;
       }
-      setStatus("Groq response too short — trying OpenRouter...");
+
+      console.log("Groq vision returned empty/short response.");
     } catch (error: any) {
-      console.log("Groq failed:", error?.message);
-      setStatus("Groq failed — trying OpenRouter...");
+      console.log("Groq vision failed:", error?.message);
     }
 
-    try {
-      setStatus("Calling OpenRouter...");
-      const data = await openRouterRequest({
-        model: "google/gemini-2.5-pro",
-        max_tokens: maxTokens,
-        temperature: 0.25,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: prompt },
-              { type: "image_url", image_url: { url: imageData } },
-            ],
-          },
-        ],
-      });
-      const text = data?.choices?.[0]?.message?.content?.trim();
-      if (text && text.length >= MIN_VALID_RESPONSE_LENGTH) {
-        setStatus("OpenRouter ✓");
-        return text;
-      }
-    } catch (error: any) {
-      console.log("OpenRouter failed:", error?.message);
-    }
-
-    setStatus("Offline");
+    setStatus("Unable to read");
     return "";
-  };
+} ;
 
   const callTextAI = async (prompt: string, maxTokens: number): Promise<string | null> => {
     try {

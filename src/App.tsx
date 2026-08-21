@@ -1,12 +1,15 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Audio } from "expo-av";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import { runRealSosSequence } from "./services/sosSequence";
+import { requestSosPermissions } from "./services/permissions";
 import Constants from "expo-constants";
 import * as ImageManipulator from "expo-image-manipulator";
 import * as Linking from "expo-linking";
 import * as Location from "expo-location";
 import { Accelerometer, Barometer, Gyroscope, Magnetometer, Pedometer } from "expo-sensors";
 import * as Speech from "expo-speech";
+import { playSosSound } from "./services/sosSound";
 import {
   ExpoSpeechRecognitionModule,
   useSpeechRecognitionEvent,
@@ -16,7 +19,9 @@ import {
   ActivityIndicator,
   AppState,
   type AppStateStatus,
+  Dimensions,
   PanResponder,
+  ScrollView,
   StatusBar,
   StyleSheet,
   Text,
@@ -30,6 +35,11 @@ import {
   BARO_SAMPLE_WINDOW_MS,
   BARO_WARN_COOLDOWN_MS,
   DOUBLE_SHAKE_WINDOW_MS,
+  FALL_FREEFALL_THRESHOLD_G,
+  FALL_IMPACT_THRESHOLD_G,
+  FALL_FREEFALL_MIN_MS,
+  FALL_STILLNESS_CONFIRM_MS,
+  FALL_STILLNESS_THRESHOLD_G,
   GYRO_TILT_COOLDOWN_MS,
   GYRO_TILT_THRESHOLD,
   LISTEN_DURATION_MS,
@@ -55,6 +65,8 @@ import {
 } from "./prompts";
 import { intentRouter } from "./services/intentRouter";
 import { navigationService } from "./services/navigationService";
+import { runGuardianSetup, type SosFlowIO } from "./services/sosFlow";
+import { loadGuardians, removeGuardian, type GuardianContact } from "./services/sosService";
 
 import type { AppMode, ConvMessage, LangKey, OcrType, SavedFace, WwmUrgency } from "./types";
 import {
@@ -64,6 +76,7 @@ import {
   isHazard,
   isVisualQuestion,
   isWalkWithMeRequest,
+  isHelpTrigger,
 } from "./utils";
 import {
   processWwmFrame,
@@ -79,6 +92,7 @@ import {
   type WwmDetectedObject,
 } from "./walkWithMeEngine";
 import { normalizeYoloDetections, type YoloResponse } from "./yolov8";
+import { onVolumeDownLongPress } from "./services/volumeButtonService";
 
 const GOOGLE_MAPS_EXPO_KEY: string =
   process.env.EXPO_PUBLIC_GOOGLE_MAPS_EXPO_KEY ?? "";
@@ -93,7 +107,11 @@ const GOOGLE_MAPS_KEY: string = USE_EAS_GOOGLE_MAPS_KEY
   : GOOGLE_MAPS_EXPO_KEY;
 
 const GROQ_KEY: string = process.env.EXPO_PUBLIC_GROQ_KEY ?? "";
+console.log("GROQ_KEY check:", GROQ_KEY ? `present, ${GROQ_KEY.length} chars` : "EMPTY");
 const OPENROUTER_KEY: string = process.env.EXPO_PUBLIC_OPENROUTER_KEY ?? "";
+const { width: SCREEN_WIDTH } = Dimensions.get("window");
+const RIGHT_EDGE_ZONE = 24;         // px from the right edge that "counts" as a swipe start
+const EDGE_SWIPE_MIN_DISTANCE = 60; // px the finger must travel left to confirm it's a real swipe
 const ROBOFLOW_API_KEY: string = Constants.expoConfig?.extra?.roboflowApiKey ?? "";
 const ROBOFLOW_MODEL_ID: string = Constants.expoConfig?.extra?.roboflowModelId ?? "";
 
@@ -123,6 +141,8 @@ export default function SentiaApp() {
   const [showSettings, setShowSettings] = useState(false);
   const [voiceGender, setVoiceGender] = useState<"female" | "male">("female");
   const [savedFaces, setSavedFaces] = useState<SavedFace[]>([]);
+  const [guardians, setGuardians] = useState<GuardianContact[]>([]);
+  const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null);
   const [isSavingFace, setIsSavingFace] = useState(false);
   const [faceToDelete, setFaceToDelete] = useState<SavedFace | null>(null);
   const [isConversationMode, setIsConversationMode] = useState(false);
@@ -131,11 +151,16 @@ export default function SentiaApp() {
   const [wwmStatus, setWwmStatus] = useState<WwmUrgency>("CLEAR");
   const [wwmStepCount, setWwmStepCount] = useState(0);
   const [privacyConsented, setPrivacyConsented] = useState<boolean | null>(null);
+  const [sosCountdown, setSosCountdown] = useState(5);
 
   const alwaysListeningRef = useRef(false);
+  const autoListenStartedRef = useRef(false);
 const wakeDetectedRef = useRef(false);
 const voiceCommandBusyRef = useRef(false);
 const speechRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+const recognitionWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+const voiceFlowActiveRef = useRef(false);
+const sosPermissionsGrantedRef = useRef(false);
 
   const cameraRef = useRef<CameraView>(null);
   const isScanningRef = useRef(false);
@@ -144,6 +169,7 @@ const speechRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const recordingRef = useRef<Audio.Recording | null>(null);
   const lastTapTimeRef = useRef(0);
   const tapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const settingsDraggingRef = useRef(false);
   const tapCountRef = useRef(0);
   const voiceGenderRef = useRef<"female" | "male">("female");
   const [voiceState, setVoiceState] = useState("idle");
@@ -158,10 +184,17 @@ const speechRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const compassHeadingRef = useRef<number | undefined>(undefined);
   const appStateRef = useRef<AppStateStatus>("active");
   const lastShakeTimeRef = useRef(0);
-  const sosTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sosTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const silentSosPendingRef = useRef(false);
+  const silentSosTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fallStateRef = useRef<"idle" | "freefall" | "impact">("idle");
+  const fallFreefallStartRef = useRef(0);
+  const fallImpactTimeRef = useRef(0);
+  const fallStillnessSamplesRef = useRef<number[]>([]);
   const emergencyContactRef = useRef<string | null>(null);
   const lastShakeForSosRef = useRef(0);
-  const cameraReadyRef = useRef(false);
+ const cameraReadyRef = useRef(false);
+   const scanConsecutiveFailuresRef = useRef(0);
   const isOnlineRef = useRef(true);
   const netPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -196,26 +229,69 @@ const speechRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pedometerSubRef = useRef<{ remove: () => void } | null>(null);
 
   const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => false,
-      onMoveShouldSetPanResponder: () => false,
-      onStartShouldSetPanResponderCapture: (evt) => {
-        if (evt.nativeEvent.touches.length === 2) {
-          const lang = langRef.current;
-          if (!lang) return true;
-          const last = lastDescriptionRef.current;
-          if (!last) {
-            Speech.speak(D("no_repeat", lang), { language: LANGUAGES[lang].tts, rate: 0.78, pitch: 1.1 });
-          } else {
-            Speech.speak(D("repeat_last", lang), { language: LANGUAGES[lang].tts, rate: 0.78, pitch: 1.1 });
-            setTimeout(() => Speech.speak(last, { language: LANGUAGES[lang].tts, rate: 0.78, pitch: 1.1 }), 800);
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => false,
+        onMoveShouldSetPanResponder: () => false,
+        onStartShouldSetPanResponderCapture: (evt) => {
+          if (evt.nativeEvent.touches.length === 2) {
+            const lang = langRef.current;
+            if (!lang) return true;
+            const last = lastDescriptionRef.current;
+            if (!last) {
+              Speech.speak(D("no_repeat", lang), { language: LANGUAGES[lang].tts, rate: 0.78, pitch: 1.1 });
+            } else {
+              Speech.speak(D("repeat_last", lang), { language: LANGUAGES[lang].tts, rate: 0.78, pitch: 1.1 });
+              setTimeout(() => Speech.speak(last, { language: LANGUAGES[lang].tts, rate: 0.78, pitch: 1.1 }), 800);
+            }
+            return true;
           }
-          return true;
-        }
-        return false;
-      },
-    }),
-  ).current;
+          if (evt.nativeEvent.touches.length === 1) {
+            const touchX = evt.nativeEvent.pageX;
+            if (touchX > SCREEN_WIDTH - RIGHT_EDGE_ZONE) {
+              edgeSwipeStartXRef.current = touchX;
+              edgeSwipeActiveRef.current = true;
+            } else {
+              edgeSwipeActiveRef.current = false;
+            }
+          }
+          return false;
+        },
+        onMoveShouldSetPanResponderCapture: (evt) => {
+          if (!edgeSwipeActiveRef.current) return false;
+          if (evt.nativeEvent.touches.length !== 1) {
+            edgeSwipeActiveRef.current = false;
+            return false;
+          }
+          const touchX = evt.nativeEvent.touches[0].pageX;
+          const delta = edgeSwipeStartXRef.current - touchX;
+          return delta > EDGE_SWIPE_MIN_DISTANCE;
+        },
+        onPanResponderGrant: () => {
+          if (edgeSwipeActiveRef.current) {
+            edgeSwipeActiveRef.current = false;
+            console.log("SOS: right-edge swipe detected");
+            Vibration.vibrate([0, 100, 60, 100]);
+            if (currentModeRef.current !== "sos") triggerSOS("edge");
+          }
+        },
+        onPanResponderRelease: () => {
+          edgeSwipeActiveRef.current = false;
+        },
+        onPanResponderTerminate: () => {
+          edgeSwipeActiveRef.current = false;
+        },
+      }),
+    ).current;
+
+
+useEffect(() => {
+  console.log("VOLUME listener registered");
+  const unsubscribe = onVolumeDownLongPress(() => {
+      console.log("VOLUME long-press received in JS! mode:", currentModeRef.current);
+      if (currentModeRef.current !== "sos") triggerSOS("volume");
+    });
+  return unsubscribe;
+}, []);
 
   useEffect(() => {
     voiceGenderRef.current = voiceGender;
@@ -226,6 +302,12 @@ const speechRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   useEffect(() => {
     savedFacesRef.current = savedFaces;
   }, [savedFaces]);
+useEffect(() => {
+    showSettingsRef.current = showSettings;
+  }, [showSettings]);
+  useEffect(() => {
+    guardiansRef.current = guardians;
+  }, [guardians]);
   useEffect(() => {
     currentModeRef.current = mode;
   }, [mode]);
@@ -242,9 +324,23 @@ const speechRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     isWalkWithMeRef.current = isWalkWithMe;
   }, [isWalkWithMe]);
 useSpeechRecognitionEvent("result", (event) => {
-  if (!alwaysListeningRef.current || voiceCommandBusyRef.current) return;
-
   const text = event.results[0]?.transcript?.trim() ?? "";
+  if (!text) return;
+  if (event.isFinal) {
+    console.log("VOICE heard:", text, "| alwaysListening:", alwaysListeningRef.current, "| mode:", currentModeRef.current);
+  }
+
+  if (event.isFinal && currentModeRef.current === "sos" && /\bcancel\b|रद्द|थांबवा/i.test(text)) {
+    cancelSOS();
+    return;
+  }
+
+  if (event.isFinal && isHelpTrigger(text) && currentModeRef.current !== "sos") {
+      triggerSOS("voice");
+      return;
+    }
+
+  if (!alwaysListeningRef.current || voiceCommandBusyRef.current) return;
   if (!text) return;
 
   setStatus(`Heard: ${text}`);
@@ -253,14 +349,33 @@ useSpeechRecognitionEvent("result", (event) => {
     handleExpoVoiceCommand(text);
   }
 });
+useSpeechRecognitionEvent("start", () => {
+  console.log("VOICE recognition STARTED");
+  if (recognitionWatchdogRef.current) {
+    clearTimeout(recognitionWatchdogRef.current);
+    recognitionWatchdogRef.current = null;
+  }
+});
+
 useSpeechRecognitionEvent("end", () => {
+  console.log("VOICE recognition ENDED — restarting. alwaysListening:", alwaysListeningRef.current, "| voiceFlowActive:", voiceFlowActiveRef.current);
+  if (recognitionWatchdogRef.current) {
+    clearTimeout(recognitionWatchdogRef.current);
+    recognitionWatchdogRef.current = null;
+  }
+  if (voiceFlowActiveRef.current) return; // guardian setup owns the mic right now — don't fight it
   restartExpoSpeechRecognitionSoon();
 });
 
 useSpeechRecognitionEvent("error", (event) => {
   if (event.error === "aborted") return;
 
-  console.warn("Speech recognition error:", event.error, event.message);
+  console.warn("VOICE recognition ERROR:", event.error, event.message, "| alwaysListening:", alwaysListeningRef.current);
+  if (recognitionWatchdogRef.current) {
+    clearTimeout(recognitionWatchdogRef.current);
+    recognitionWatchdogRef.current = null;
+  }
+  if (voiceFlowActiveRef.current) return;
   restartExpoSpeechRecognitionSoon(1000);
 });
 
@@ -288,9 +403,15 @@ useSpeechRecognitionEvent("error", (event) => {
       }
       if (map.sentia_emergency) emergencyContactRef.current = map.sentia_emergency;
     });
+loadGuardians().then(setGuardians);
 
     Audio.requestPermissionsAsync().then(({ granted }) => setAudioPermission(granted));
-
+        // SOS (SMS/Call/phone-state) permission request moved out of here — it used to
+        // fire at the same time as this Audio request and the camera request, and
+        // Android can only show one permission dialog at a time. Racing them caused
+        // some requests to silently auto-deny with no dialog ever appearing. It's
+        // now requested separately, only after camera permission is settled — see
+        // the effect below.
     const pollNetwork = async () => {
       const online = await checkInternetConnection();
       if (online !== isOnlineRef.current) {
@@ -364,66 +485,114 @@ useSpeechRecognitionEvent("error", (event) => {
     });
 
     Accelerometer.setUpdateInterval(100);
-    let lastX = 0;
-    let lastY = 0;
-    let lastZ = 0;
-    const accelSub = Accelerometer.addListener(({ x, y, z }) => {
-      const dx = Math.abs(x - lastX);
-      const dy = Math.abs(y - lastY);
-      const dz = Math.abs(z - lastZ);
-      lastX = x;
-      lastY = y;
-      lastZ = z;
-      const now = Date.now();
+        let lastX = 0;
+        let lastY = 0;
+        let lastZ = 0;
+        const accelSub = Accelerometer.addListener(({ x, y, z }) => {
+          const dx = Math.abs(x - lastX);
+          const dy = Math.abs(y - lastY);
+          const dz = Math.abs(z - lastZ);
+          lastX = x;
+          lastY = y;
+          lastZ = z;
+          const now = Date.now();
+          const magnitude = Math.sqrt(x * x + y * y + z * z);
 
-      if (isWalkWithMeRef.current && wwmUseAccelStepsRef.current) {
-        const motionPulse = dx + dy + dz;
-        if (motionPulse > 0.42 && now - lastAccelStepTimeRef.current > 350) {
-          lastAccelStepTimeRef.current = now;
-          wwmStepCountRef.current += 1;
-          setWwmStepCount(wwmStepCountRef.current);
-        }
-      }
-
-      const isRealShake = dx > 1.2 && dy > 1.0 && dz > 0.8;
-      const totalAcc = dx + dy + dz;
-
-      if (isRealShake && totalAcc > SHAKE_THRESHOLD && now - lastShakeTimeRef.current > SHAKE_COOLDOWN_MS) {
-        lastShakeTimeRef.current = now;
-        if (now - lastShakeForSosRef.current < DOUBLE_SHAKE_WINDOW_MS) {
-          lastShakeForSosRef.current = 0;
-          triggerSOS();
-          return;
-        }
-        lastShakeForSosRef.current = now;
-        const currentMode = currentModeRef.current;
-        if (currentMode === "sos") {
-          cancelSOS();
-          return;
-        }
-        if (currentMode === "walkwithme") {
-          stopWalkWithMe();
-          return;
-        }
-        if (currentMode === "facemanage" || currentMode === "facedeleteconfirm") {
-          setMode("settings");
-          setFaceToDelete(null);
-          return;
-        }
-        setShowSettings((prev) => {
-          const lang = langRef.current;
-          if (!prev) {
-            isScanningRef.current = false;
-            setIsScanning(false);
-            Speech.stop();
-            isSpeakingRef.current = false;
-          } else if (lang) {
-            speak(FS("settingsClosed", lang), lang);
+          if (isWalkWithMeRef.current && wwmUseAccelStepsRef.current) {
+            const motionPulse = dx + dy + dz;
+            if (motionPulse > 0.42 && now - lastAccelStepTimeRef.current > 350) {
+              lastAccelStepTimeRef.current = now;
+              wwmStepCountRef.current += 1;
+              setWwmStepCount(wwmStepCountRef.current);
+            }
           }
-          return !prev;
+
+          // --- Fall detection: free-fall dip -> impact spike -> stillness = real fall ---
+                if (fallStateRef.current === "idle") {
+                  if (magnitude < FALL_FREEFALL_THRESHOLD_G) {
+                    console.log("FALL: possible free-fall dip detected, magnitude:", magnitude.toFixed(2));
+                    fallStateRef.current = "freefall";
+                    fallFreefallStartRef.current = now;
+                  }
+                } else if (fallStateRef.current === "freefall") {
+                  const freefallDuration = now - fallFreefallStartRef.current;
+                  if (magnitude > FALL_IMPACT_THRESHOLD_G && freefallDuration > FALL_FREEFALL_MIN_MS) {
+                    console.log("FALL: impact detected after", freefallDuration, "ms of free-fall — checking stillness...");
+                    fallStateRef.current = "impact";
+                    fallImpactTimeRef.current = now;
+                    fallStillnessSamplesRef.current = [];
+                  } else if (freefallDuration > 1000) {
+                    fallStateRef.current = "idle"; // dip too long with no impact — not a fall, reset
+                  }
+                } else if (fallStateRef.current === "impact") {
+            fallStillnessSamplesRef.current.push(magnitude);
+            if (now - fallImpactTimeRef.current > FALL_STILLNESS_CONFIRM_MS) {
+              const samples = fallStillnessSamplesRef.current;
+              const avgDeviation = samples.reduce((sum, m) => sum + Math.abs(m - 1), 0) / (samples.length || 1);
+              console.log("FALL: stillness check, avgDeviation =", avgDeviation.toFixed(3));
+              fallStateRef.current = "idle";
+              fallStillnessSamplesRef.current = [];
+              if (avgDeviation < FALL_STILLNESS_THRESHOLD_G) {
+                triggerSOS("fall");
+              }
+            }
+          }
+
+          // --- Shake detection: double-shake triggers/cancels; single shake only cancels a LOUD (voice) SOS ---
+          // --- Shake detection: double-shake triggers/cancels; single shake only cancels a LOUD (voice) SOS ---
+                const isRealShake = dx > 1.2 && dy > 1.0 && dz > 0.8;
+                const totalAcc = dx + dy + dz;
+
+                if (isRealShake && totalAcc > SHAKE_THRESHOLD && now - lastShakeTimeRef.current > SHAKE_COOLDOWN_MS) {
+                  lastShakeTimeRef.current = now;
+                  const isDoubleShake = now - lastShakeForSosRef.current < DOUBLE_SHAKE_WINDOW_MS;
+                  console.log("SHAKE: real shake detected, totalAcc:", totalAcc.toFixed(2), "| isDoubleShake:", isDoubleShake);
+
+                  if (isDoubleShake) {
+                    lastShakeForSosRef.current = 0;
+                    if (silentSosPendingRef.current) {
+                      console.log("SOS: double-shake cancelling silent countdown");
+                      cancelSOS(); // double-shake cancels a silent fall/shake countdown
+                    } else if (currentModeRef.current !== "sos") {
+                      console.log("SOS: double-shake starting silent countdown");
+                      triggerSOS("shake");
+                    }
+                    return;
+                  }
+
+                  lastShakeForSosRef.current = now;
+
+            if (currentModeRef.current === "sos" && sosSourceRef.current === "voice") {
+              cancelSOS(); // single shake cancels only the loud, visible voice-triggered SOS
+              return;
+            }
+            if (silentSosPendingRef.current) {
+              return; // single shake must NOT cancel a silent countdown — only double-shake can
+            }
+            if (currentModeRef.current === "walkwithme") {
+              stopWalkWithMe();
+              return;
+            }
+            if (currentModeRef.current === "facemanage" || currentModeRef.current === "facedeleteconfirm") {
+              setMode("settings");
+              setFaceToDelete(null);
+              return;
+            }
+            setShowSettings((prev) => {
+              const lang = langRef.current;
+              if (!prev) {
+                isScanningRef.current = false;
+                setIsScanning(false);
+                Speech.stop();
+                isSpeakingRef.current = false;
+              } else if (lang) {
+                speak(FS("settingsClosed", lang), lang);
+              }
+              return !prev;
+            });
+          }
         });
-      }
-    });
+
 
     return () => {
       if (netPollRef.current) clearInterval(netPollRef.current);
@@ -437,6 +606,7 @@ useSpeechRecognitionEvent("error", (event) => {
       pedometerSubRef.current?.remove();
       pedometerSubRef.current = null;
       if (sosTimerRef.current) clearTimeout(sosTimerRef.current);
+            if (silentSosTimerRef.current) clearTimeout(silentSosTimerRef.current);
     };
   }, []);
   /* eslint-enable react-hooks/exhaustive-deps */
@@ -447,7 +617,17 @@ useSpeechRecognitionEvent("error", (event) => {
       setTimeout(() => speakRaw(WELCOME[language], language), 600);
     }
   }, [language]);
-
+useEffect(() => {
+    if (language && audioPermission && !autoListenStartedRef.current) {
+      autoListenStartedRef.current = true;
+      const timer = setTimeout(() => {
+        alwaysListeningRef.current = true;
+        setAlwaysListening(true);
+        startExpoSpeechRecognition();
+      }, 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [language, audioPermission]);
   useEffect(() => {
     if (showSettings && language) {
       Speech.stop();
@@ -456,10 +636,25 @@ useSpeechRecognitionEvent("error", (event) => {
   }, [showSettings, language]);
 
   useEffect(() => {
-  navigationService.configure({
-    googleMapsApiKey: GOOGLE_MAPS_KEY,
-  });
-}, []);
+    navigationService.configure({
+      googleMapsApiKey: GOOGLE_MAPS_KEY,
+    });
+  }, []);
+
+  useEffect(() => {
+    // Only request SOS (SMS/Call/phone-state) permission once camera permission
+    // is already settled — and wait a beat for the camera dialog's own closing
+    // animation to fully finish before opening the next one, so they don't overlap.
+    if (permission?.granted) {
+      const timer = setTimeout(() => {
+        requestSosPermissions().then((granted) => {
+          console.log("SOS permissions (SMS/Call) granted?", granted);
+          sosPermissionsGrantedRef.current = granted;
+        });
+      }, 800);
+      return () => clearTimeout(timer);
+    }
+  }, [permission?.granted]);
 
   useEffect(() => {
     isScanningRef.current = isScanning;
@@ -481,71 +676,190 @@ useSpeechRecognitionEvent("error", (event) => {
     }
   }, [isScanning]);
 
-  const triggerSOS = () => {
-    const lang = langRef.current ?? "en";
-    if (isWalkWithMeRef.current) stopWalkWithMe(true);
-    setMode("sos");
-    currentModeRef.current = "sos";
-    Vibration.vibrate([0, 300, 200, 300, 200, 300]);
-    speak(D("sos_warning", lang), lang);
-    sosTimerRef.current = setTimeout(() => {
-      const contact = emergencyContactRef.current;
-      Linking.openURL(contact ? `tel:${contact}` : "tel:112");
-      setMode("idle");
-      currentModeRef.current = "idle";
-    }, 5000);
-  };
+const sosSourceRef = useRef<"shake" | "voice" | "volume" | "edge" | "fall">("voice");
+const edgeSwipeActiveRef = useRef(false);
+const edgeSwipeStartXRef = useRef(0);
+const sosSequenceRunningRef = useRef(false);
 
-  const cancelSOS = () => {
-    if (sosTimerRef.current) {
-      clearTimeout(sosTimerRef.current);
-      sosTimerRef.current = null;
-    }
-    const lang = langRef.current ?? "en";
-    setMode("idle");
-    currentModeRef.current = "idle";
-    speak(D("sos_cancelled", lang), lang);
-  };
+ // Fires the actual SOS silently — no red screen, no spoken announcement.
+   // Step 2 will replace the console.log below with the real SMS + guardian-calling sequence.
+   const fireSilentSOS = (source: "shake" | "volume" | "edge" | "fall") => {
+       if (sosSequenceRunningRef.current) {
+         console.log(`SOS: ignoring ${source} trigger — a sequence is already in progress`);
+         return;
+       }
+       console.log(`SOS: silently firing (source: ${source})`);
+       currentModeRef.current = "sos";
+       setMode("sos");
+       sosSequenceRunningRef.current = true;
+       Vibration.vibrate([0, 80, 100, 80]);
+          runRealSosSequence(sosPermissionsGrantedRef.current, undefined, {
+                   onSmsResult: (name, success) => {
+                     playSosSound(success ? "success" : "fail", true);
+                   },
+                   onCallResult: (name, outcome) => {
+                     playSosSound(outcome === "answered" ? "success" : "fail", true);
+                   },
+                 }).then((result) => {
+                   console.log("SOS: real sequence finished", result);
+                 }).finally(() => {
+                   sosSequenceRunningRef.current = false;
+                 });
+                 setTimeout(() => {
+            setMode("idle");
+            currentModeRef.current = "idle";
+          }, 1500);
+        };
 
-  const setSosContact = async () => {
-    const lang = langRef.current ?? "en";
-    speak(D("sos_set_prompt", lang), lang);
-    await new Promise((resolve) => setTimeout(resolve, 2800));
-    try {
-      const { recording } = await Audio.Recording.createAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
-      recordingRef.current = recording;
-      await new Promise((resolve) => setTimeout(resolve, LISTEN_DURATION_MS[lang] ?? 7000));
-      await recording.stopAndUnloadAsync();
-      recordingRef.current = null;
-      const uri = recording.getURI();
-      if (!uri) {
-        speak(D("sos_set_failed", lang), lang);
-        return;
-      }
-      const formData = new FormData();
-      formData.append("file", { uri, type: "audio/m4a", name: "sos.m4a" } as any);
-      formData.append("model", "whisper-large-v3");
-      formData.append("language", "en");
-      const response = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${GROQ_KEY}` },
-        body: formData,
-      });
-      const data = await response.json();
-      const spoken = (data?.text ?? "").trim();
-      const digits = spoken.replace(/\D/g, "");
-      if (digits.length < 6) {
-        speak(D("sos_set_failed", lang), lang);
-        return;
-      }
-      emergencyContactRef.current = digits;
-      await AsyncStorage.setItem("sentia_emergency", digits);
-      const message = D("sos_set_saved", lang).replace("{number}", digits.split("").join(" "));
-      speak(message, lang);
-    } catch {
-      speak(D("sos_set_failed", lang), lang);
-    }
-  };
+   const triggerSOS = (source: "shake" | "voice" | "volume" | "edge" | "fall" = "voice") => {
+     const lang = langRef.current ?? "en";
+     if (sosTimerRef.current || silentSosPendingRef.current || currentModeRef.current === "sos") return;
+     if (isWalkWithMeRef.current) stopWalkWithMe(true);
+     sosSourceRef.current = source;
+
+    if (source === "voice") {
+          if (sosSequenceRunningRef.current) {
+            console.log("SOS: ignoring voice trigger — a sequence is already in progress");
+            return;
+          }
+          // Already spoken out loud by the user — no secrecy to protect. Stays loud/visible.
+          setShowSettings(false);
+          setMode("sos");
+          currentModeRef.current = "sos";
+          sosSequenceRunningRef.current = true;
+          Vibration.vibrate([0, 300, 200, 300, 200, 300]);
+          setSosCountdown(0);
+          speak(D("sos_warning_direct", lang), lang, true);
+          speak(D("sos_placeholder_trigger", lang), lang);
+                         runRealSosSequence(sosPermissionsGrantedRef.current, undefined, {
+                            onSmsResult: (name, success) => {
+                              playSosSound(success ? "success" : "fail", false);
+                            },
+                            onCallResult: (name, outcome) => {
+                              playSosSound(outcome === "answered" ? "success" : "fail", false);
+                            },
+                          }).then((result) => {
+                            console.log("SOS: real sequence finished", result);
+                          }).finally(() => {
+                            sosSequenceRunningRef.current = false;
+                          });
+                          return;
+            }
+
+     if (source === "volume" || source === "edge") {
+       // Deliberate, hard to trigger by accident — fire immediately, silently, no cancel window.
+       fireSilentSOS(source);
+       return;
+     }
+
+     // source === "shake" or "fall": could plausibly be accidental —
+         // silent 5-second window, cancellable only by a double-shake.
+         console.log(`SOS: silent 5s countdown started (source: ${source})`);
+         currentModeRef.current = "sos";
+         setMode("sos"); // internal state only — the screen stays completely normal for these sources
+         silentSosPendingRef.current = true;
+         Vibration.vibrate(60); // tiny private pulse, felt only by whoever's holding the phone
+         silentSosTimerRef.current = setTimeout(() => {
+           silentSosTimerRef.current = null;
+           if (silentSosPendingRef.current) {
+             silentSosPendingRef.current = false;
+             console.log(`SOS: 5s countdown elapsed with no cancel (source: ${source}) — firing now`);
+             fireSilentSOS(source);
+           }
+         }, 5000);
+   };
+
+ const cancelSOS = () => {
+     if (sosTimerRef.current) {
+       clearInterval(sosTimerRef.current);
+       sosTimerRef.current = null;
+     }
+     if (silentSosTimerRef.current) {
+       clearTimeout(silentSosTimerRef.current);
+       silentSosTimerRef.current = null;
+     }
+     silentSosPendingRef.current = false;
+     fallStateRef.current = "idle";
+     fallStillnessSamplesRef.current = [];
+
+     const lang = langRef.current ?? "en";
+     setSosCountdown(5);
+     setMode("idle");
+     currentModeRef.current = "idle";
+
+     if (sosSourceRef.current === "voice") {
+       speak(D("sos_cancelled", lang), lang);
+     } else {
+       Vibration.vibrate(40); // quiet private confirmation only — nothing spoken, nothing shown
+     }
+   };
+
+ const speakAndWait = (text: string): Promise<void> => {
+     const lang = langRef.current ?? "en";
+     return new Promise((resolve) => {
+       Speech.stop();
+       setTimeout(() => {
+         Speech.speak(text, {
+           language: LANGUAGES[lang].tts,
+           rate: 0.78,
+           onDone: () => resolve(),
+           onError: () => resolve(),
+         });
+       }, 150);
+     });
+   };
+
+ const setSosContact = async () => {
+       setMode("sos");
+       currentModeRef.current = "sos";
+
+       // Claim the mic exclusively for guardian setup.
+       voiceFlowActiveRef.current = true;
+       console.log("GUARDIAN FLOW: started, mic claimed");
+       if (speechRestartTimerRef.current) {
+         clearTimeout(speechRestartTimerRef.current);
+         speechRestartTimerRef.current = null;
+       }
+       if (recognitionWatchdogRef.current) {
+         clearTimeout(recognitionWatchdogRef.current);
+         recognitionWatchdogRef.current = null;
+       }
+       try { ExpoSpeechRecognitionModule.abort(); } catch {}
+
+       // try/finally: no matter what happens inside guardian setup — success,
+       // a misheard word, a thrown error — the mic MUST be handed back at the end.
+       try {
+         const io: SosFlowIO = { lang: langRef.current ?? "en", groqKey: GROQ_KEY, speakAndWait };
+         const updated = await runGuardianSetup(io);
+         setGuardians(updated);
+       } catch (err) {
+         console.warn("GUARDIAN FLOW: error inside flow", err);
+       } finally {
+         setMode("idle");
+         currentModeRef.current = "idle";
+         try {
+           await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true });
+         } catch {}
+         voiceFlowActiveRef.current = false;
+         console.log("GUARDIAN FLOW: ended, mic released back to continuous listening");
+         if (alwaysListeningRef.current && !voiceCommandBusyRef.current) {
+           restartExpoSpeechRecognitionSoon(900);
+         }
+       }
+     };
+
+const showSettingsRef = useRef(false);
+const guardiansRef = useRef<GuardianContact[]>([]);
+
+const confirmGuardianDelete = (index: number) => {
+  const lang = langRef.current ?? "en";
+  const name = guardians[index]?.name ?? "";
+  removeGuardian(index).then((updated) => {
+    setGuardians(updated);
+    speak(`${name} removed.`, lang);
+  });
+  setPendingDeleteIndex(null);
+};
 
   const speakRaw = (text: string, lang: LangKey, urgent = false, gender?: "female" | "male") => {
     Speech.stop();
@@ -568,7 +882,7 @@ useSpeechRecognitionEvent("error", (event) => {
 
   const speak = (text: string, lang: LangKey, urgent = false) => speakRaw(text, lang, urgent);
 
-  const speakAndThen = (text: string, lang: LangKey, onFinished: () => void, urgent = false) => {
+const speakAndThen = (text: string, lang: LangKey, onFinished: () => void, urgent = false, force = false) => {
     Speech.stop();
     isSpeakingRef.current = true;
     const g = voiceGenderRef.current;
@@ -580,14 +894,16 @@ useSpeechRecognitionEvent("error", (event) => {
         pitch: urgent ? 1.3 : g === "male" ? 0.75 : 1.1,
         onDone: () => {
           isSpeakingRef.current = false;
-          if (isConversationModeRef.current && convActiveAtCall) onFinished();
+          if (force || (isConversationModeRef.current && convActiveAtCall)) onFinished();
         },
         onError: () => {
           isSpeakingRef.current = false;
+          if (force) onFinished();
         },
       });
     }, 200);
   };
+
 
   const speakForWwm = (text: string, lang: LangKey, urgency: WwmUrgency): Promise<void> =>
     new Promise((resolve) => {
@@ -655,18 +971,22 @@ useSpeechRecognitionEvent("error", (event) => {
     });
 
   const runScanCycle = async () => {
-    if (!isScanningRef.current || appStateRef.current !== "active") return;
-    if (isProcessingRef.current) {
-      if (isScanningRef.current) setTimeout(() => runScanCycleRef.current(), SCAN_INTERVAL_MS);
-      return;
-    }
-    try {
-      await analyzeFrameForScan();
-    } catch {
-      isProcessingRef.current = false;
-    }
-    if (isScanningRef.current) setTimeout(() => runScanCycleRef.current(), SCAN_INTERVAL_MS);
-  };
+      if (!isScanningRef.current || appStateRef.current !== "active") return;
+      if (isProcessingRef.current) {
+        if (isScanningRef.current) setTimeout(() => runScanCycleRef.current(), SCAN_INTERVAL_MS);
+        return;
+      }
+      try {
+        await analyzeFrameForScan();
+      } catch {
+        isProcessingRef.current = false;
+      }
+      if (isScanningRef.current) {
+        const failures = scanConsecutiveFailuresRef.current;
+        const nextDelay = failures > 0 ? Math.min(SCAN_INTERVAL_MS * (failures + 1), 20000) : SCAN_INTERVAL_MS;
+        setTimeout(() => runScanCycleRef.current(), nextDelay);
+      }
+    };
   runScanCycleRef.current = runScanCycle;
 
   const analyzeFrameForScan = async () => {
@@ -689,9 +1009,13 @@ useSpeechRecognitionEvent("error", (event) => {
       if (!resized.base64) return;
       const prompt = getScanPrompt(lang, savedFacesRef.current, compassHeadingRef.current);
       const result = await callVisionAI(resized.base64, lang, prompt, 280);
-      if (!isScanningRef.current) return;
-      if (!result || result === D("fallback", lang)) return;
-      lastDescriptionRef.current = result;
+            if (!isScanningRef.current) return;
+            if (!result || result === D("fallback", lang)) {
+              scanConsecutiveFailuresRef.current += 1;
+              return;
+            }
+            scanConsecutiveFailuresRef.current = 0;
+            lastDescriptionRef.current = result;
       setDescription(result);
       setIsLoading(false);
       if (isHazard(result)) {
@@ -971,9 +1295,9 @@ useSpeechRecognitionEvent("error", (event) => {
     const imageData = `data:image/jpeg;base64,${base64}`;
     try {
       const response = await groqRequest({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
-        max_tokens: 5,
-        temperature: 0.0,
+              model: "qwen/qwen3.6-27b",
+              max_tokens: 5,
+              temperature: 0.0,
         messages: [
           {
             role: "user",
@@ -1073,9 +1397,9 @@ useSpeechRecognitionEvent("error", (event) => {
 
     try {
       const data = await groqRequest({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
-        max_tokens: WWM_MAX_TOKENS,
-        temperature: 0.1,
+              model: "qwen/qwen3.6-27b",
+              max_tokens: WWM_MAX_TOKENS,
+              temperature: 0.1,
         messages: [
           {
             role: "user",
@@ -1109,9 +1433,9 @@ useSpeechRecognitionEvent("error", (event) => {
     try {
       setStatus("Calling Groq...");
       const data = await groqRequest({
-        model: "meta-llama/llama-4-scout-17b-16e-instruct",
-        max_tokens: maxTokens,
-        temperature: 0.25,
+              model: "qwen/qwen3.6-27b",
+              max_tokens: maxTokens,
+              temperature: 0.25,
         messages: [
           {
             role: "user",
@@ -1199,10 +1523,10 @@ useSpeechRecognitionEvent("error", (event) => {
     conversationHistoryRef.current = [];
   };
 
-  const answerConversationally = async (question: string, onComplete?: () => void) => {
-    const lang = langRef.current;
-    if (!lang) return;
-    try {
+  const answerConversationally = async (question: string, onComplete?: () => void, forceOnComplete = false) => {
+      const lang = langRef.current;
+      if (!lang) return;
+      try {
       setIsLoading(true);
       setMode("thinking");
       currentModeRef.current = "thinking";
@@ -1226,16 +1550,16 @@ useSpeechRecognitionEvent("error", (event) => {
       setMode("idle");
       currentModeRef.current = "idle";
       setIsLoading(false);
-      if (onComplete) speakAndThen(answer, lang, onComplete);
-      else speak(answer, lang);
-    } catch (error: any) {
-      setStatus(`Error: ${error?.message}`);
-      setIsLoading(false);
-      setMode("idle");
-      currentModeRef.current = "idle";
-    }
-  };
-
+      if (onComplete) speakAndThen(answer, lang, onComplete, false, forceOnComplete);
+            else speak(answer, lang);
+          } catch (error: any) {
+            setStatus(`Error: ${error?.message}`);
+            setIsLoading(false);
+            setMode("idle");
+            currentModeRef.current = "idle";
+            if (forceOnComplete && onComplete) onComplete();
+          }
+        };
   const startListening = async () => {
     const lang = langRef.current;
     if (!audioPermission || !lang) return;
@@ -1583,33 +1907,46 @@ const startExpoSpeechRecognition = async () => {
   }
 
   try {
-    ExpoSpeechRecognitionModule.start({
-      lang: speechLangForCurrentLanguage(),
-      interimResults: true,
-      continuous: true,
-      maxAlternatives: 1,
-      contextualStrings: [
-        "Hey Sentia",
-        "Sentia",
-        "where am I",
-        "current location",
-        "navigate to",
-        "directions to",
-        "nearby hospital",
-        "nearby pharmacy",
-        "nearby bus stop",
-        "stop navigation",
-      ],
-      androidIntentOptions: {
-        EXTRA_LANGUAGE_MODEL: "web_search",
-        EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: 8000,
-        EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS: 6000,
-      },
-    });
-  } catch (error) {
-    console.warn("Speech recognition start failed:", error);
-    restartExpoSpeechRecognitionSoon();
-  }
+      ExpoSpeechRecognitionModule.start({
+        lang: speechLangForCurrentLanguage(),
+        interimResults: true,
+        continuous: true,
+        maxAlternatives: 1,
+        contextualStrings: [
+          "Hey Sentia",
+          "Sentia",
+          "help",
+          "bachao",
+          "madad",
+          "vachva",
+          "where am I",
+          "current location",
+          "navigate to",
+          "directions to",
+          "nearby hospital",
+          "nearby pharmacy",
+          "nearby bus stop",
+          "stop navigation",
+        ],
+        androidIntentOptions: {
+                EXTRA_LANGUAGE_MODEL: "web_search",
+                EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: 1500,
+                EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS: 1000,
+              },
+      });
+      if (recognitionWatchdogRef.current) clearTimeout(recognitionWatchdogRef.current);
+      recognitionWatchdogRef.current = setTimeout(() => {
+            recognitionWatchdogRef.current = null;
+            console.log("VOICE watchdog fired — recognition silently failed to start, forcing retry");
+            if (alwaysListeningRef.current && !voiceCommandBusyRef.current && !voiceFlowActiveRef.current) {
+              try { ExpoSpeechRecognitionModule.abort(); } catch {}
+              startExpoSpeechRecognition();
+            }
+          }, 4000);
+    } catch (error) {
+      console.warn("Speech recognition start failed:", error);
+      restartExpoSpeechRecognitionSoon();
+    }
 };
 
 const stopExpoSpeechRecognition = () => {
@@ -1632,15 +1969,19 @@ const stopExpoSpeechRecognition = () => {
 }).catch(() => {});
 };
 
-const restartExpoSpeechRecognitionSoon = (delay = 800) => {
-  if (!alwaysListeningRef.current || voiceCommandBusyRef.current) return;
+const restartExpoSpeechRecognitionSoon = (delay = 500) => {
+  if (!alwaysListeningRef.current || voiceCommandBusyRef.current || voiceFlowActiveRef.current) return;
   if (speechRestartTimerRef.current) clearTimeout(speechRestartTimerRef.current);
 
   speechRestartTimerRef.current = setTimeout(() => {
     speechRestartTimerRef.current = null;
-    if (alwaysListeningRef.current && !voiceCommandBusyRef.current) {
-      startExpoSpeechRecognition();
+    if (!alwaysListeningRef.current || voiceCommandBusyRef.current || voiceFlowActiveRef.current) return;
+    if (isSpeakingRef.current) {
+      // App is still talking — wait, don't let the mic hear itself
+      restartExpoSpeechRecognitionSoon(300);
+      return;
     }
+    startExpoSpeechRecognition();
   }, delay);
 };
 
@@ -1815,14 +2156,14 @@ if (
 
 const intent = intentRouter.route(command);
 
-if (intent.mode === "navigation") { 
+if (intent.mode === "navigation") {
       const response = await navigationService.handleIntent(intent);
       speakAndThen(response, lang, () => {
         voiceCommandBusyRef.current = false;
         setMode("idle");
         currentModeRef.current = "idle";
         restartExpoSpeechRecognitionSoon();
-      });
+      }, false, true); // force: must clear the busy flag even outside "conversation mode"
       return;
     }
 
@@ -1831,7 +2172,7 @@ if (intent.mode === "navigation") {
       setMode("idle");
       currentModeRef.current = "idle";
       restartExpoSpeechRecognitionSoon();
-    });
+    }, true); // force: same reason
   } catch (error) {
     console.warn("Voice command failed:", error);
     speakAndThen("Sorry, I could not complete that voice command.", lang, () => {
@@ -1839,7 +2180,7 @@ if (intent.mode === "navigation") {
       setMode("idle");
       currentModeRef.current = "idle";
       restartExpoSpeechRecognitionSoon();
-    });
+    }, false, true); // force: same reason
   }
 };
 
@@ -2070,15 +2411,22 @@ return;
                 return;
               }
               speak(FS("takingPhoto", lang), lang);
-              setTimeout(async () => {
-                speak(D("photo_now", lang), lang);
-                const photo = await cameraRef.current!.takePictureAsync({ quality: 0.7, base64: true });
-                if (!photo?.base64) {
-                  setIsSavingFace(false);
-                  setMode("idle");
-                  currentModeRef.current = "idle";
-                  return;
-                }
+                            setTimeout(async () => {
+                              if (!cameraRef.current || currentModeRef.current === "sos") {
+                                console.log("SAVE FACE: aborted — camera gone or SOS interrupted the flow");
+                                setIsSavingFace(false);
+                                setMode("idle");
+                                currentModeRef.current = "idle";
+                                return;
+                              }
+                              speak(D("photo_now", lang), lang);
+                              const photo = await cameraRef.current.takePictureAsync({ quality: 0.7, base64: true });
+                              if (!photo?.base64) {
+                                setIsSavingFace(false);
+                                setMode("idle");
+                                currentModeRef.current = "idle";
+                                return;
+                              }
                 const resized = await ImageManipulator.manipulateAsync(
                   photo.uri,
                   [{ resize: { width: 480 } }],
@@ -2173,7 +2521,7 @@ return;
   };
 
   const getStatusLabel = () => {
-    if (mode === "sos") return "🆘 SOS — shake to cancel";
+      if (mode === "sos" && sosSourceRef.current === "voice") return "🆘 SOS — shake to cancel";
     if (isHazardAlert) return "⚠️ HAZARD DETECTED";
     if (!isOnline) return "📵 Offline";
     if (mode === "walkwithme") {
@@ -2210,9 +2558,22 @@ return;
   };
 
   if (showSettings && language) {
-    return (
-      <TouchableOpacity style={styles.settingsScreen} activeOpacity={1} onPress={handleSettingsTap}>
-        <StatusBar barStyle="light-content" />
+      return (
+        <View style={styles.settingsScreen}>
+          <StatusBar barStyle="light-content" />
+          <ScrollView
+            contentContainerStyle={styles.settingsScrollContent}
+            showsVerticalScrollIndicator={true}
+            onTouchStart={() => { settingsDraggingRef.current = false; }}
+            onScrollBeginDrag={() => { settingsDraggingRef.current = true; }}
+            onTouchEnd={() => {
+              if (settingsDraggingRef.current) {
+                settingsDraggingRef.current = false;
+                return;
+              }
+              handleSettingsTap();
+            }}
+          >
         <Text style={styles.settingsTitle}>{mode === "facemanage" ? "👥" : mode === "facedeleteconfirm" ? "🗑️" : "⚙️"}</Text>
         <Text style={styles.settingsHeading}>
           {mode === "facemanage"
@@ -2291,13 +2652,52 @@ return;
                       : "No faces saved yet"}
               </Text>
             </View>
-            <View style={styles.facesCountBox}>
-              <Text style={styles.facesCountText}>
-                🆘 SOS:{" "}
-                {emergencyContactRef.current ??
-                  (language === "hi" ? "नंबर नहीं — डायल 112" : language === "mr" ? "नंबर नाही — 112" : "Not set — will dial 112")}
-              </Text>
-            </View>
+            <View style={styles.guardianBox} onStartShouldSetResponder={() => true} onTouchEnd={(e) => e.stopPropagation()}>
+                                      <Text style={styles.guardianHeading}>
+                                        🆘 {language === "hi" ? "गार्डियन" : language === "mr" ? "गार्डियन" : "Guardians"}
+                                      </Text>
+                                      {guardians.length > 0 ? (
+                                        guardians.map((g, idx) => (
+                                          <View key={idx} style={styles.guardianRow}>
+                                            <View>
+                                              <Text style={styles.guardianName}>{g.name}</Text>
+                                              <Text style={styles.guardianPhone}>{g.phone}</Text>
+                                            </View>
+                                            {pendingDeleteIndex === idx ? (
+                                              <View style={{ flexDirection: "row", gap: 8 }}>
+                                                <TouchableOpacity
+                                                  onPress={() => confirmGuardianDelete(idx)}
+                                                  style={{ paddingVertical: 6, paddingHorizontal: 12, backgroundColor: "#ff4444", borderRadius: 8 }}
+                                                >
+                                                  <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Confirm</Text>
+                                                </TouchableOpacity>
+                                                <TouchableOpacity
+                                                  onPress={() => setPendingDeleteIndex(null)}
+                                                  style={{ paddingVertical: 6, paddingHorizontal: 12, backgroundColor: "rgba(255,255,255,0.15)", borderRadius: 8 }}
+                                                >
+                                                  <Text style={{ color: "#fff", fontWeight: "700", fontSize: 13 }}>Cancel</Text>
+                                                </TouchableOpacity>
+                                              </View>
+                                            ) : (
+                                              <TouchableOpacity
+                                                onPress={() => setPendingDeleteIndex(idx)}
+                                                style={{ padding: 8, backgroundColor: "rgba(255,68,68,0.2)", borderRadius: 10 }}
+                                              >
+                                                <Text style={{ fontSize: 20 }}>🗑️</Text>
+                                              </TouchableOpacity>
+                                            )}
+                                          </View>
+                                        ))
+                                      ) : (
+                                        <Text style={styles.guardianEmpty}>
+                                          {language === "hi"
+                                            ? "कोई गार्डियन सेट नहीं"
+                                            : language === "mr"
+                                              ? "कोणताही गार्डियन सेट नाही"
+                                              : "No guardians set yet"}
+                                        </Text>
+                                      )}
+                                    </View>
             <View style={styles.settingsInstructions}>
               <Text style={styles.settingsInstructionText}>👆 {language === "hi" ? "एक बार = महिला आवाज़" : language === "mr" ? "एकदा = महिला आवाज" : "One tap = Female voice"}</Text>
               <Text style={styles.settingsInstructionText}>👆👆 {language === "hi" ? "दो बार = पुरुष आवाज़" : language === "mr" ? "दोनदा = पुरुष आवाज" : "Double tap = Male voice"}</Text>
@@ -2309,7 +2709,8 @@ return;
             </View>
           </>
         )}
-      </TouchableOpacity>
+    </ScrollView>
+      </View>
     );
   }
 
@@ -2401,32 +2802,53 @@ return;
   }
 
   if (!permission?.granted) {
-    return (
-      <View style={styles.langScreen}>
-        <StatusBar barStyle="light-content" />
-        <Text style={styles.appName}>Sentia</Text>
-        <Text style={styles.chooseText}>Camera permission is required</Text>
-        <TouchableOpacity style={styles.langButton} onPress={requestPermission}>
-          <Text style={styles.langButtonText}>Allow Camera</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
-  if (mode === "sos") {
-    return (
-      <View style={[styles.container, { backgroundColor: "#8b0000" }]}>
-        <StatusBar barStyle="light-content" />
-        <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 24 }}>
-          <Text style={{ fontSize: 80 }}>🆘</Text>
-          <Text style={{ color: "#fff", fontSize: 28, fontWeight: "800", textAlign: "center" }}>SOS</Text>
-          <Text style={{ color: "#ffaaaa", fontSize: 18, textAlign: "center", paddingHorizontal: 32 }}>
-            Calling emergency contact in 5 seconds.{"\n"}Shake phone to cancel.
-          </Text>
+      console.log("CAMERA PERMISSION STATE:", JSON.stringify(permission));
+      return (
+        <View style={styles.langScreen}>
+          <StatusBar barStyle="light-content" />
+          <Text style={styles.appName}>Sentia</Text>
+          <Text style={styles.chooseText}>Camera permission is required</Text>
+          <TouchableOpacity
+            style={styles.langButton}
+            onPress={() => {
+              if (permission?.canAskAgain === false) {
+                Linking.openSettings();
+              } else {
+                requestPermission();
+              }
+            }}
+          >
+            <Text style={styles.langButtonText}>
+              {permission?.canAskAgain === false ? "Open Phone Settings" : "Allow Camera"}
+            </Text>
+          </TouchableOpacity>
         </View>
-      </View>
-    );
-  }
+      );
+    }
+
+  if (mode === "sos" && sosSourceRef.current === "voice") {
+        return (
+          <View style={[styles.container, { backgroundColor: "#8b0000" }]}>
+          <StatusBar barStyle="light-content" />
+          <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 24 }}>
+            <Text style={{ fontSize: 80 }}>🆘</Text>
+            <Text style={{ color: "#fff", fontSize: 28, fontWeight: "800", textAlign: "center" }}>SOS</Text>
+            {sosSourceRef.current === "shake" ? (
+              <>
+                <Text style={{ color: "#fff", fontSize: 64, fontWeight: "900" }}>{sosCountdown}</Text>
+                <Text style={{ color: "#ffaaaa", fontSize: 18, textAlign: "center", paddingHorizontal: 32 }}>
+                  Sending in {sosCountdown} second{sosCountdown === 1 ? "" : "s"}.{"\n"}Shake phone or say "cancel" to stop.
+                </Text>
+              </>
+            ) : (
+              <Text style={{ color: "#ffaaaa", fontSize: 18, textAlign: "center", paddingHorizontal: 32 }}>
+                Sending your location and alert to guardians now.{"\n"}Say "cancel" to stop.
+              </Text>
+            )}
+          </View>
+        </View>
+      );
+    }
 
   const wwmBgColor = {
     CLEAR: "rgba(0,180,80,0.18)",
@@ -2719,7 +3141,8 @@ const styles = StyleSheet.create({
   },
   listeningIcon: { fontSize: 72 },
   listeningText: { color: "#fff", fontSize: 22, fontWeight: "600", textAlign: "center" },
-  settingsScreen: { flex: 1, backgroundColor: "#0a0a1a", alignItems: "center", justifyContent: "center", padding: 32, gap: 20 },
+  settingsScreen: { flex: 1, backgroundColor: "#0a0a1a" },
+  settingsScrollContent: { alignItems: "center", padding: 32, gap: 20, paddingBottom: 60, flexGrow: 1, justifyContent: "center" },
   settingsTitle: { fontSize: 64 },
   settingsHeading: { color: "#fff", fontSize: 32, fontWeight: "800", letterSpacing: 2 },
   voiceIndicator: {
@@ -2736,6 +3159,28 @@ const styles = StyleSheet.create({
   voiceIndicatorLabel: { color: "#6200EE", fontSize: 18, fontWeight: "700" },
   facesCountBox: { width: "100%", backgroundColor: "#111122", borderRadius: 16, padding: 16, alignItems: "center" },
   facesCountText: { color: "#fff", fontSize: 14, textAlign: "center", lineHeight: 22 },
+  guardianBox: {
+      width: "100%",
+      backgroundColor: "#111122",
+      borderRadius: 16,
+      padding: 16,
+      gap: 10,
+      borderWidth: 1,
+      borderColor: "#6200EE",
+    },
+    guardianHeading: { color: "#6200EE", fontSize: 15, fontWeight: "800", letterSpacing: 0.5 },
+    guardianRow: {
+      flexDirection: "row",
+      justifyContent: "space-between",
+      alignItems: "center",
+      backgroundColor: "#1a1a2e",
+      borderRadius: 10,
+      paddingVertical: 10,
+      paddingHorizontal: 14,
+    },
+    guardianName: { color: "#fff", fontSize: 16, fontWeight: "700" },
+    guardianPhone: { color: "rgba(255,255,255,0.65)", fontSize: 15, fontWeight: "500" },
+    guardianEmpty: { color: "#aaa", fontSize: 14, textAlign: "center" },
   settingsInstructions: { width: "100%", backgroundColor: "#111122", borderRadius: 16, padding: 20, gap: 12 },
   settingsInstructionText: { color: "rgba(255,255,255,0.7)", fontSize: 15, lineHeight: 24 },
   facesListBox: { width: "100%", backgroundColor: "#111122", borderRadius: 16, padding: 16, gap: 12 },
@@ -2790,5 +3235,5 @@ const styles = StyleSheet.create({
     textAlign: "center",
     lineHeight: 18,
     paddingHorizontal: 8,
-  },
+  }
 });

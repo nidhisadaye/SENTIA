@@ -117,3 +117,13 @@ export const headingToCardinal = (degrees: number): string => {
   const directions = ["North", "North-East", "East", "South-East", "South", "South-West", "West", "North-West"];
   return directions[Math.round(degrees / 45) % 8];
 };
+
+export const isHelpTrigger = (text: string): boolean => {
+  const t = text.toLowerCase().trim();
+  const patterns = [
+    /\bhelp\b/, /\bsos\b/, /\bemergency\b/,
+    /मदद/, /बचाओ/, /मदत/, /वाचवा/,
+    /\bbachao\b/, /\bmadad\b/, /\bvachva\b/,
+  ];
+  return patterns.some((p) => p.test(t));
+};

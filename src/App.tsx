@@ -1,3 +1,4 @@
+import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Audio } from "expo-av";
 import { CameraView, useCameraPermissions } from "expo-camera";
@@ -20,6 +21,7 @@ import {
   AppState,
   type AppStateStatus,
   Dimensions,
+  Image,
   PanResponder,
   ScrollView,
   StatusBar,
@@ -27,7 +29,7 @@ import {
   Text,
   TouchableOpacity,
   Vibration,
-  View,
+  View
 } from "react-native";
 import {
   BARO_INDOOR_THRESHOLD_HPA,
@@ -57,11 +59,10 @@ import {
 import { D, DIALOGUE_PREFIXES, FS } from "./dialogue";
 import { LANG_SELECT_AUDIO, LANGUAGES, WELCOME } from "./languages";
 import {
-  CLASSIFY_PROMPT,
   getConversationPrompt,
   getFaceDescPrompt,
   getScanPrompt,
-  READ_PROMPTS,
+  READ_PROMPTS
 } from "./prompts";
 import { intentRouter } from "./services/intentRouter";
 import { navigationService } from "./services/navigationService";
@@ -106,8 +107,7 @@ const GOOGLE_MAPS_KEY: string = USE_EAS_GOOGLE_MAPS_KEY
   ? GOOGLE_MAPS_EAS_KEY
   : GOOGLE_MAPS_EXPO_KEY;
 
-const GROQ_KEY: string = process.env.EXPO_PUBLIC_GROQ_KEY ?? "";
-console.log("GROQ_KEY check:", GROQ_KEY ? `present, ${GROQ_KEY.length} chars` : "EMPTY");
+const GROQ_KEY: string = process.env.EXPO_PUBLIC_GROQ_API_KEY ?? "";
 const OPENROUTER_KEY: string = process.env.EXPO_PUBLIC_OPENROUTER_KEY ?? "";
 const { width: SCREEN_WIDTH } = Dimensions.get("window");
 const RIGHT_EDGE_ZONE = 24;         // px from the right edge that "counts" as a swipe start
@@ -118,6 +118,8 @@ const ROBOFLOW_MODEL_ID: string = Constants.expoConfig?.extra?.roboflowModelId ?
 const playEarcon = async () => {
   Vibration.vibrate(30);
 };
+
+const SENTIA_LOGO = require("../assets/images/sentia-logo.png");
 
 const checkInternetConnection = async (): Promise<boolean> => {
   try {
@@ -1420,71 +1422,73 @@ const speakAndThen = (text: string, lang: LangKey, onFinished: () => void, urgen
     return "";
   };
 
-  const callVisionAI = async (base64: string, lang: LangKey, prompt: string, maxTokens: number): Promise<string> => {
+  const callVisionAI = async (
+    base64: string,
+    lang: LangKey,
+    prompt: string,
+    maxTokens: number
+  ): Promise<string> => {
     const imageData = `data:image/jpeg;base64,${base64}`;
 
     if (USE_DIRECT && !GROQ_KEY && !OPENROUTER_KEY) {
       const errMsg = D("no_api_key", lang);
-      setStatus("❌ No API keys — check app.config.js");
+      setStatus("No API keys");
       speak(errMsg, lang);
       return "";
     }
 
     try {
       setStatus("Calling Groq...");
+
       const data = await groqRequest({
-              model: "qwen/qwen3.6-27b",
-              max_tokens: maxTokens,
-              temperature: 0.25,
+
+        model: "qwen/qwen3.6-27b",
+        max_tokens: 80,
+        temperature: 0.25,
+        reasoning_effort: "none",
         messages: [
           {
             role: "user",
             content: [
-              { type: "text", text: prompt },
-              { type: "image_url", image_url: { url: imageData } },
+              {
+                type: "text",
+                text:
+                  `${prompt}\n\n` +
+                  "IMPORTANT: Read the text in the image and return ONLY the readable text. " +
+                  "Do not explain your reasoning. Do not describe the image. " +
+                  "Do not use <think> tags.",
+              },
+              {
+                type: "image_url",
+                image_url: { url: imageData },
+              },
             ],
           },
         ],
       });
-      const text = data?.choices?.[0]?.message?.content?.trim();
+
+      const text =
+        data?.choices?.[0]?.message?.content?.trim() ?? "";
+
+      console.log(
+        "GROQ VISION RESPONSE:",
+        JSON.stringify(data?.choices?.[0]?.message)
+      );
+      console.log("GROQ VISION TEXT:", text);
+
       if (text && text.length >= MIN_VALID_RESPONSE_LENGTH) {
         setStatus("Groq ✓");
         return text;
       }
-      setStatus("Groq response too short — trying OpenRouter...");
+
+      console.log("Groq vision returned empty/short response.");
     } catch (error: any) {
-      console.log("Groq failed:", error?.message);
-      setStatus("Groq failed — trying OpenRouter...");
+      console.log("Groq vision failed:", error?.message);
     }
 
-    try {
-      setStatus("Calling OpenRouter...");
-      const data = await openRouterRequest({
-        model: "google/gemini-2.5-pro",
-        max_tokens: maxTokens,
-        temperature: 0.25,
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: prompt },
-              { type: "image_url", image_url: { url: imageData } },
-            ],
-          },
-        ],
-      });
-      const text = data?.choices?.[0]?.message?.content?.trim();
-      if (text && text.length >= MIN_VALID_RESPONSE_LENGTH) {
-        setStatus("OpenRouter ✓");
-        return text;
-      }
-    } catch (error: any) {
-      console.log("OpenRouter failed:", error?.message);
-    }
-
-    setStatus("Offline");
+    setStatus("Unable to read");
     return "";
-  };
+} ;
 
   const callTextAI = async (prompt: string, maxTokens: number): Promise<string | null> => {
     try {
@@ -2949,17 +2953,57 @@ return;
           styles.topBar,
           isHazardAlert && styles.hazardBar,
           !isOnline && styles.offlineBar,
-          mode === "walkwithme" && { backgroundColor: wwmBgColor, borderWidth: 1.5, borderColor: wwmBorderColor },
+          mode === "walkwithme" && {
+            backgroundColor: wwmBgColor,
+            borderWidth: 1.5,
+            borderColor: wwmBorderColor,
+          },
         ]}
         pointerEvents="none"
       >
+        <View style={styles.topBarBrand}>
+          <Image
+            source={SENTIA_LOGO}
+            style={styles.sentiaLogo}
+            resizeMode="contain"
+          />
+
+          <View style={styles.brandTextGroup}>
+            <Text style={styles.topBarBrandText}>SENTIA</Text>
+            <Text style={styles.topBarMiniText}>AI VISION</Text>
+          </View>
+        </View>
+
+        <View style={styles.topBarDivider} />
+
         <Text style={styles.topBarText}>{getStatusLabel()}</Text>
       </View>
 
       {mode !== "walkwithme" && (
-        <View style={[styles.descBox, isHazardAlert && styles.hazardDescBox]} pointerEvents="none">
-          {isLoading && <ActivityIndicator color="#fff" size="small" style={{ marginBottom: 8 }} />}
-          <Text style={styles.descText}>{description || WELCOME[language]}</Text>
+        <View
+          style={[styles.descBox, isHazardAlert && styles.hazardDescBox]}
+          pointerEvents="none"
+        >
+          <View style={styles.aiInsightHeader}>
+            <View style={styles.aiInsightDot} />
+            <Text style={styles.aiInsightLabel}>
+              {isLoading ? "ANALYZING" : "SENTIA AI"}
+            </Text>
+          </View>
+
+          <View style={styles.aiInsightDivider} />
+
+          {isLoading && (
+            <ActivityIndicator
+              color="#7C6CFF"
+              size="small"
+              style={{ marginBottom: 10 }}
+            />
+          )}
+
+          <Text style={styles.descText}>
+            {description || WELCOME[language]}
+          </Text>
         </View>
       )}
 
@@ -2979,7 +3023,17 @@ return;
           delayLongPress={LONG_PRESS_DELAY}
           onPress={handleVoiceTap}
         >
-          <Text style={styles.micBtnText}>{mode === "walkwithme" ? "🚶" : isConversationMode ? "🔁" : "🎤"}</Text>
+          <Ionicons
+            name={
+              mode === "walkwithme"
+                ? "walk"
+                : isConversationMode
+                  ? "volume-high"
+                  : "mic" 
+            }
+            size={32}
+            color="#FFFFFF"
+          />
         </TouchableOpacity>
 
         <TouchableOpacity
@@ -3008,60 +3062,266 @@ const styles = StyleSheet.create({
   hazardContainer: { backgroundColor: "#1a0000" },
   fullScreen: { flex: 1 },
   camera: { flex: 1 },
+  sentiaLogo: {
+  width: 36,
+  height: 36,
+  marginRight: 10,
+  },
   topBar: {
-    position: "absolute",
-    top: 48,
-    left: 16,
-    right: 16,
-    backgroundColor: "rgba(0,0,0,0.7)",
-    borderRadius: 12,
-    padding: 10,
-    alignItems: "center",
+  position: "absolute",
+  top: 24,
+  left: 18,
+  right: 18,
+  backgroundColor: "rgba(8, 10, 24, 0.90)",
+  borderRadius: 22,
+  paddingVertical: 10,
+  paddingHorizontal: 18,
+  alignItems: "center",
+  borderWidth: 1,
+  borderColor: "rgba(124, 108, 255, 0.38)",
+  shadowColor: "#000",
+  shadowOffset: { width: 0, height: 7 },
+  shadowOpacity: 0.4,
+  shadowRadius: 16,
+  elevation: 10,
+  },
+
+  topBarBrand: {
+  flexDirection: "row",
+  alignItems: "center",
+  alignSelf: "flex-start",
+  },
+
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: "#35E0B5",
+    marginRight: 8,
+    shadowColor: "#35E0B5",
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.9,
+    shadowRadius: 6,
+  },
+
+  brandTextGroup: {
+  alignItems: "flex-start",
+  justifyContent: "center",
+  },
+
+  topBarBrandText: {
+  color: "#FFFFFF",
+  fontSize: 16,
+  fontWeight: "900",
+  letterSpacing: 1.8,
+  },
+
+  topBarMiniText: {
+    color: "rgba(180, 170, 255, 0.75)",
+    fontSize: 8,
+    fontWeight: "800",
+    letterSpacing: 2,
+    marginTop: 1,
+  },
+
+  topBarDivider: {
+    width: "100%",
+    height: 1,
+    backgroundColor: "rgba(255,255,255,0.08)",
+    marginVertical: 9,
   },
   hazardBar: { backgroundColor: "rgba(176,0,32,0.9)" },
   offlineBar: { backgroundColor: "rgba(60,60,60,0.9)" },
-  topBarText: { color: "#fff", fontSize: 15, fontWeight: "700" },
-  descBox: {
-    position: "absolute",
-    bottom: 130,
-    left: 16,
-    right: 16,
-    backgroundColor: "rgba(0,0,0,0.85)",
-    borderRadius: 20,
-    padding: 20,
-    alignItems: "center",
+  topBarText: {
+  color: "#FFFFFF",
+  fontSize: 15,
+  fontWeight: "800",
+  letterSpacing: 0.8,
   },
-  hazardDescBox: { backgroundColor: "rgba(176,0,32,0.9)", borderWidth: 2, borderColor: "#ff4444" },
-  descText: { color: "#fff", fontSize: 18, lineHeight: 28, fontWeight: "500", textAlign: "center" },
-  gestureGuide: { position: "absolute", bottom: 90, left: 16, right: 16, alignItems: "center" },
-  gestureText: { color: "rgba(255,255,255,0.4)", fontSize: 11, textAlign: "center" },
+  descBox: {
+  position: "absolute",
+  bottom: 180,
+  left: 18,
+  right: 18,
+  backgroundColor: "rgba(8, 10, 24, 0.92)",
+  borderRadius: 24,
+  paddingVertical: 16,
+  paddingHorizontal: 18,
+  alignItems: "center",
+  borderWidth: 1,
+  borderColor: "rgba(124, 108, 255, 0.38)",
+  shadowColor: "#000",
+  shadowOffset: { width: 0, height: 10 },
+  shadowOpacity: 0.45,
+  shadowRadius: 20,
+  elevation: 12,
+  },
+  hazardDescBox: {
+  backgroundColor: "rgba(95, 5, 20, 0.94)",
+  borderWidth: 2,
+  borderColor: "#FF4D67",
+  shadowColor: "#FF304F",
+  shadowOffset: { width: 0, height: 0 },
+  shadowOpacity: 0.65,
+  shadowRadius: 18,
+  elevation: 14,
+  },
+  aiInsightHeader: {
+  width: "100%",
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "center",
+},
+
+aiInsightDot: {
+  width: 7,
+  height: 7,
+  borderRadius: 4,
+  backgroundColor: "#7C6CFF",
+  marginRight: 7,
+  shadowColor: "#7C6CFF",
+  shadowOffset: { width: 0, height: 0 },
+  shadowOpacity: 0.9,
+  shadowRadius: 6,
+},
+
+aiInsightLabel: {
+  color: "rgba(255,255,255,0.70)",
+  fontSize: 11,
+  fontWeight: "900",
+  letterSpacing: 2,
+},
+
+aiInsightDivider: {
+  width: "100%",
+  height: 1,
+  backgroundColor: "rgba(255,255,255,0.07)",
+  marginTop: 10,
+  marginBottom: 12,
+},
+
+descText: {
+  color: "#F7F7FF",
+  fontSize: 16,
+  lineHeight: 25,
+  fontWeight: "600",
+  textAlign: "center",
+  letterSpacing: 0.2,
+},
+
+gestureGuide: {
+  position: "absolute",
+  bottom: 116,
+  left: 24,
+  right: 24,
+  alignItems: "center",
+},
+
+gestureText: {
+  color: "rgba(255,255,255,0.72)",
+  fontSize: 11,
+  fontWeight: "700",
+  textAlign: "center",
+  letterSpacing: 0.4,
+  lineHeight: 18,
+  paddingHorizontal: 12,
+},
+
   controls: {
-    position: "absolute",
-    bottom: 0,
-    left: 0,
-    right: 0,
-    paddingBottom: 24,
-    paddingHorizontal: 24,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
+  position: "absolute",
+  bottom: 18,
+  left: 16,
+  right: 16,
+  height: 92,
+  paddingHorizontal: 18,
+  paddingVertical: 10,
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "space-between",
+  backgroundColor: "rgba(10, 12, 28, 0.92)",
+  borderRadius: 30,
+  borderWidth: 1,
+  borderColor: "rgba(124, 108, 255, 0.42)",
+  shadowColor: "#000",
+  shadowOffset: { width: 0, height: 8 },
+  shadowOpacity: 0.52,
+  shadowRadius: 22,
+  elevation: 12,
   },
   micBtn: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: "rgba(98,0,238,0.5)",
+  width: 72,
+  height: 72,
+  borderRadius: 36,
+  backgroundColor: "rgba(98, 0, 238, 0.88)",
+  alignItems: "center",
+  justifyContent: "center",
+  borderWidth: 2,
+  borderColor: "rgba(180, 160, 255, 0.9)",
+  shadowColor: "#7C6CFF",
+  shadowOffset: { width: 0, height: 0 },
+  shadowOpacity: 0.68,
+  shadowRadius: 19,
+  elevation: 12,
+  },
+
+  micBtnActive: {
+    backgroundColor: "rgba(176, 0, 32, 0.95)",
+    borderColor: "#FF6B7D",
+    shadowColor: "#FF304F",
+    shadowOpacity: 0.75,
+    shadowRadius: 20,
+    elevation: 16,
+  },
+
+  micBtnConversation: {
+    backgroundColor: "rgba(0, 150, 100, 0.92)",
+    borderColor: "#5CFFD0",
+    borderWidth: 2,
+    shadowColor: "#00DFA2",
+    shadowOpacity: 0.65,
+    shadowRadius: 18,
+    elevation: 14,
+  },
+
+  micBtnWwm: {
+    width: 78,
+    height: 78,
+    borderRadius: 39,
+    backgroundColor: "rgba(0, 170, 90, 0.94)",
+    borderColor: "#7CFFB2",
+    borderWidth: 3,
+    shadowColor: "#00E676",
+    shadowOpacity: 0.8,
+    shadowRadius: 22,
+    elevation: 18,
+  },
+
+micBtnText: {
+  fontSize: 26,
+},
+  langSwitchBtn: {
+    minWidth: 108,
+    height: 56,
+    paddingHorizontal: 18,
+    backgroundColor: "rgba(10, 12, 28, 0.88)",
+    borderRadius: 24,
     alignItems: "center",
     justifyContent: "center",
-    borderWidth: 2,
-    borderColor: "#6200EE",
+    borderWidth: 1,
+    borderColor: "rgba(124, 108, 255, 0.48)",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 12,
+    elevation: 8,
   },
-  micBtnActive: { backgroundColor: "rgba(176,0,32,0.8)", borderColor: "#ff4444" },
-  micBtnConversation: { backgroundColor: "rgba(0,150,100,0.6)", borderColor: "#00c878", borderWidth: 3 },
-  micBtnWwm: { backgroundColor: "rgba(0,180,80,0.5)", borderColor: "#00c850", borderWidth: 3, width: 68, height: 68, borderRadius: 34 },
-  micBtnText: { fontSize: 26 },
-  langSwitchBtn: { paddingHorizontal: 20, paddingVertical: 10, backgroundColor: "rgba(255,255,255,0.1)", borderRadius: 20 },
-  langSwitchText: { color: "#fff", fontSize: 14 },
+
+  langSwitchText: {
+    color: "#FFFFFF",
+    fontSize: 14,
+    fontWeight: "700",
+    letterSpacing: 0.4,
+  },
   wwmOverlay: {
     position: "absolute",
     top: 0,

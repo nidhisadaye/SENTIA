@@ -59,6 +59,7 @@ import {
 import { D, DIALOGUE_PREFIXES, FS } from "./dialogue";
 import { LANG_SELECT_AUDIO, LANGUAGES, WELCOME } from "./languages";
 import {
+  CLASSIFY_PROMPT,
   getConversationPrompt,
   getFaceDescPrompt,
   getScanPrompt,
@@ -2837,18 +2838,9 @@ return;
           <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 24 }}>
             <Text style={{ fontSize: 80 }}>🆘</Text>
             <Text style={{ color: "#fff", fontSize: 28, fontWeight: "800", textAlign: "center" }}>SOS</Text>
-            {sosSourceRef.current === "shake" ? (
-              <>
-                <Text style={{ color: "#fff", fontSize: 64, fontWeight: "900" }}>{sosCountdown}</Text>
-                <Text style={{ color: "#ffaaaa", fontSize: 18, textAlign: "center", paddingHorizontal: 32 }}>
-                  Sending in {sosCountdown} second{sosCountdown === 1 ? "" : "s"}.{"\n"}Shake phone or say "cancel" to stop.
-                </Text>
-              </>
-            ) : (
-              <Text style={{ color: "#ffaaaa", fontSize: 18, textAlign: "center", paddingHorizontal: 32 }}>
-                Sending your location and alert to guardians now.{"\n"}Say "cancel" to stop.
-              </Text>
-            )}
+            <Text style={{ color: "#ffaaaa", fontSize: 18, textAlign: "center", paddingHorizontal: 32 }}>
+              Sending your location and alert to guardians now.{"\n"}Say "cancel" to stop.
+            </Text>
           </View>
         </View>
       );

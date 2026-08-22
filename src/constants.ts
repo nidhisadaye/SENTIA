@@ -20,8 +20,13 @@ export const LISTEN_DURATION_MS: Record<string, number> = { en: 7000, hi: 10000,
 export const SILENCE_BUFFER_MS = 220;
 export const LONG_PRESS_DELAY = 900;
 export const SHAKE_THRESHOLD = 4.0;
-export const SHAKE_COOLDOWN_MS = 4000;
-export const DOUBLE_SHAKE_WINDOW_MS = 1800;
+export const SHAKE_COOLDOWN_MS = 350;
+export const FALL_FREEFALL_THRESHOLD_G = 0.4;   // magnitude dip below this = possible free-fall
+export const FALL_IMPACT_THRESHOLD_G = 2.5;      // magnitude spike above this right after = impact
+export const FALL_FREEFALL_MIN_MS = 100;         // dip must last at least this long to count
+export const FALL_STILLNESS_CONFIRM_MS = 800;    // how long we watch for stillness after impact
+export const FALL_STILLNESS_THRESHOLD_G = 0.3;   // how "still" it must be to confirm a real fall
+export const DOUBLE_SHAKE_WINDOW_MS = 1500;
 export const MIN_VALID_RESPONSE_LENGTH = 15;
 
 export const GYRO_TILT_THRESHOLD = 1.4;
